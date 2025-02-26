@@ -12,6 +12,8 @@ import uuid
 import time
 import av
 import whisper_live.utils as utils
+from flask import request
+from flask_socketio import SocketIO
 
 
 class Client:
@@ -20,6 +22,12 @@ class Client:
     """
     INSTANCES = {}
     END_OF_AUDIO = "END_OF_AUDIO"
+
+    def default_callback(text, is_final):
+        # Truncate to last 3 entries for brevity.
+        text = text[-3:]
+        utils.clear_screen()
+        utils.print_transcript(text)
 
     def __init__(
         self,
@@ -33,6 +41,7 @@ class Client:
         log_transcription=True,
         max_clients=4,
         max_connection_time=600,
+        callback=None
     ):
         """
         Initializes a Client instance for audio recording and streaming to a server.
@@ -69,6 +78,7 @@ class Client:
         self.log_transcription = log_transcription
         self.max_clients = max_clients
         self.max_connection_time = max_connection_time
+        self.callback = callback if callback is not None else Client.default_callback
 
         if translate:
             self.task = "translate"
@@ -112,7 +122,7 @@ class Client:
         elif status == "WARNING":
             print(f"Message from Server: {message_data['message']}")
 
-    def process_segments(self, segments):
+    def process_segments(self, segments, is_final):
         """Processes transcript segments."""
         text = []
         for i, seg in enumerate(segments):
@@ -129,6 +139,7 @@ class Client:
             self.last_response_received = time.time()
             self.last_received_segment = segments[-1]["text"]
 
+        self.callback(text, is_final)
         if self.log_transcription:
             # Truncate to last 3 entries for brevity.
             text = text[-3:]
@@ -178,7 +189,7 @@ class Client:
             return
 
         if "segments" in message.keys():
-            self.process_segments(message["segments"])
+            self.process_segments(message["segments"], message["is_final"])
 
     def on_error(self, ws, error):
         print(f"[ERROR] WebSocket Error: {error}")
@@ -317,7 +328,7 @@ class TranscriptionTeeClient:
             print(f"[WARN]: Unable to access microphone. {error}")
             self.stream = None
 
-    def __call__(self, audio=None, rtsp_url=None, hls_url=None, save_file=None):
+    def __call__(self, audio=None, rtsp_url=None, hls_url=None, save_file=None, audio_stream=None):
         """
         Start the transcription process.
 
@@ -348,6 +359,8 @@ class TranscriptionTeeClient:
             self.play_file(resampled_file)
         elif rtsp_url is not None:
             self.process_rtsp_stream(rtsp_url)
+        elif audio_stream is not None:
+            self.setup_socket_handlers(audio_stream)
         else:
             self.record()
 
@@ -372,6 +385,68 @@ class TranscriptionTeeClient:
         for client in self.clients:
             if (unconditional or client.recording):
                 client.send_packet_to_server(packet)
+
+    def handle_stream(self, audio_data: bytes, client_id: str) -> None:
+        """
+        Process incoming audio stream data from the browser.
+        
+        Args:
+            audio_data (bytes): Raw audio data received from the browser
+            client_id (str): Unique identifier for the client connection
+        """
+        n_audio_file = 0
+        if self.save_output_recording:
+            if os.path.exists("chunks"):
+                shutil.rmtree("chunks")
+            os.makedirs("chunks")
+
+        try:
+            self.frames += audio_data
+
+            # Convert incoming audio data to float array
+            audio_array = self.bytes_to_float_array(audio_data)
+            
+            # Multicast the audio data to all connected clients
+            self.multicast_packet(audio_array.tobytes())
+                
+            # save frames if more than a minute
+            if len(self.frames) > 60 * self.rate:
+                if self.save_output_recording:
+                    self.save_chunk(n_audio_file)
+                    n_audio_file += 1
+                self.frames = b""
+
+            self.write_all_clients_srt()
+                
+        except Exception as e:
+            print(f"[ERROR]: Error processing audio stream: {str(e)}")
+            
+    def setup_socket_handlers(self, socketio: SocketIO) -> None:
+        """
+        Set up WebSocket event handlers for the Flask-SocketIO instance.
+        
+        Args:
+            socketio (SocketIO): Flask-SocketIO instance to register handlers
+        """
+        
+        @socketio.on('audio_stream')
+        def handle_audio_stream(data):
+            # print(data)
+            self.handle_stream(data, request.sid)
+        
+        @socketio.on('finished')
+        def handle_message_finished(data):
+            print("Will continue recording")
+            for client in self.clients:
+                client.recording = True
+            
+        @socketio.on('stream_end')
+        def handle_stream_end():
+            # Handle end of stream similar to file playback
+            self.multicast_packet(Client.END_OF_AUDIO.encode('utf-8'), True)
+            self.write_all_clients_srt()
+            self.close_all_clients()
+            
 
     def play_file(self, filename):
         """
@@ -643,6 +718,7 @@ class TranscriptionTeeClient:
         if os.path.exists("chunks"):
             shutil.rmtree("chunks")
 
+
     @staticmethod
     def bytes_to_float_array(audio_bytes):
         """
@@ -708,11 +784,12 @@ class TranscriptionClient(TranscriptionTeeClient):
         max_clients=4,
         max_connection_time=600,
         mute_audio_playback=False,
+        callback = None
     ):
         self.client = Client(
             host, port, lang, translate, model, srt_file_path=output_transcription_path,
             use_vad=use_vad, log_transcription=log_transcription, max_clients=max_clients,
-            max_connection_time=max_connection_time
+            max_connection_time=max_connection_time, callback=callback
         )
 
         if save_output_recording and not output_recording_filename.endswith(".wav"):

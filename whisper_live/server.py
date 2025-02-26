@@ -18,6 +18,8 @@ try:
 except Exception:
     pass
 
+import traceback
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -239,7 +241,7 @@ class TranscriptionServer:
                 websocket.close()
                 return False  # Indicates that the connection should not continue
 
-            if self.backend.is_tensorrt():
+            if self.backend.is_tensorrt() or self.use_vad:
                 self.vad_detector = VoiceActivityDetector(frame_rate=self.RATE)
             self.initialize_client(websocket, options, faster_whisper_custom_model_path,
                                    whisper_tensorrt_path, trt_multilingual)
@@ -251,6 +253,7 @@ class TranscriptionServer:
             logging.info("Connection closed by client")
             return False
         except Exception as e:
+            traceback.print_exc()
             logging.error(f"Error during new connection initialization: {str(e)}")
             return False
 
@@ -258,11 +261,10 @@ class TranscriptionServer:
         frame_np = self.get_audio_from_websocket(websocket)
         client = self.client_manager.get_client(websocket)
         if frame_np is False:
-            if self.backend.is_tensorrt():
-                client.set_eos(True)
+            client.set_eos(True)
             return False
 
-        if self.backend.is_tensorrt():
+        if self.backend == "tensorrt" or self.use_vad:
             voice_active = self.voice_activity(websocket, frame_np)
             if voice_active:
                 self.no_voice_activity_chunks = 0
@@ -388,6 +390,7 @@ class TranscriptionServer:
             if self.no_voice_activity_chunks > 3:
                 client = self.client_manager.get_client(websocket)
                 if not client.eos:
+                    logging.info("No voice activity detected. Setting EOS flag.")
                     client.set_eos(True)
                 time.sleep(0.1)    # Sleep 100m; wait some voice activity.
             return False
@@ -556,6 +559,7 @@ class ServeClientBase(object):
                 json.dumps({
                     "uid": self.client_uid,
                     "segments": segments,
+                    "is_final": self.eos
                 })
             )
         except Exception as e:
@@ -801,6 +805,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         self.no_speech_thresh = 0.45
         self.same_output_threshold = 10
         self.end_time_for_same_output = None
+        self.eos = False if use_vad else True
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if device == "cuda":
@@ -846,6 +851,18 @@ class ServeClientFasterWhisper(ServeClientBase):
                 }
             )
         )
+
+    
+    def set_eos(self, eos):
+        """
+        Sets the End of Speech (EOS) flag.
+
+        Args:
+            eos (bool): The value to set for the EOS flag.
+        """
+        self.lock.acquire()
+        self.eos = eos
+        self.lock.release()
 
     def create_model(self, device):
         """
@@ -913,17 +930,20 @@ class ServeClientFasterWhisper(ServeClientBase):
             depends on the implementation of the `transcriber.transcribe` method but typically
             includes the transcribed text.
         """
-        if ServeClientFasterWhisper.SINGLE_MODEL:
-            ServeClientFasterWhisper.SINGLE_MODEL_LOCK.acquire()
-        result, info = self.transcriber.transcribe(
-            input_sample,
-            initial_prompt=self.initial_prompt,
-            language=self.language,
-            task=self.task,
-            vad_filter=self.use_vad,
-            vad_parameters=self.vad_parameters if self.use_vad else None)
-        if ServeClientFasterWhisper.SINGLE_MODEL:
-            ServeClientFasterWhisper.SINGLE_MODEL_LOCK.release()
+        if not self.eos:
+            if ServeClientFasterWhisper.SINGLE_MODEL:
+                ServeClientFasterWhisper.SINGLE_MODEL_LOCK.acquire()
+            result, info = self.transcriber.transcribe(
+                input_sample,
+                initial_prompt=self.initial_prompt,
+                language=self.language,
+                task=self.task,
+                vad_filter=self.use_vad,
+                vad_parameters=self.vad_parameters if self.use_vad else None)
+            if ServeClientFasterWhisper.SINGLE_MODEL:
+                ServeClientFasterWhisper.SINGLE_MODEL_LOCK.release()
+        else:
+            result = info = None
 
         if self.language is None and info is not None:
             self.set_language(info)
